@@ -1,0 +1,166 @@
+---
+title: "wga_DetachmentViabilityStaining"
+author: "Antony"
+date: "2022-06-14"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+restore environment (via Renv package)
+
+```{r setup, include=FALSE}
+
+if (!requireNamespace("renv", quietly = TRUE)) {
+  install.packages("renv")
+}
+
+if (!renv::status()$synchronized) {
+  renv::restore(prompt = FALSE)
+}
+```
+
+```{r, libraries}
+suppressPackageStartupMessages({
+library(readxl)
+library(ggplot2)
+library(dplyr)
+library(tidyverse)
+library(stringr)
+library(patchwork)
+library(data.table)
+library(lme4)
+library(lmerTest)
+library(ARTool)
+})
+
+setDTthreads(2)
+```
+
+WGA and cell viability
+
+```{r}
+TB_wga <- fread("wga_viability_trypanblue.csv")
+
+ggplot(data = TB_wga, aes(x = Cellline, y = Viability, color = Treatments)) + 
+  geom_boxplot() +
+  ylim(0,100) +
+  ylab("Viability (%)") +
+  xlab("Cell lines") +
+  theme_bw() +
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_blank(),
+    axis.line = element_line()
+  )
+
+# ggsave(plot = TB_box, filename = 'pdfs_man/boxplot_viability.pdf')
+
+
+art_model <- art(Viability ~ as.factor(Cellline) * as.factor(Treatments), data = TB_wga)
+anova(art_model)
+
+```
+
+Mechanical vs. enzymatic detachment (FACS)
+
+```{r}
+FACS_wga <- fread("wga_detachment_facs.csv")
+FACS_wga$Treatment <- factor(FACS_wga$Treatment, levels = c("Scraped", "Accutase", "Trypsin"))
+
+ggplot(data = FACS_wga, aes(x = Cellline, y = WGA_mean_MFI, color = Treatment)) + 
+  geom_boxplot() +
+  coord_cartesian(ylim = c(0,2)) +
+  ylab("WGA-AF594 (Normalized MFI)") +
+  xlab("Cell lines") +
+  theme_bw() +
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_blank(),
+    axis.line = element_line()
+  )
+
+# ggsave('pdfs_man/boxplot_detachmentMethods.pdf')
+
+fit <- lmer(WGA_mean_MFI ~ Treatment + (1 | Cellline), data = FACS_wga)
+
+summary(fit)
+```
+
+PI vs. Hoechst staining
+
+```{r}
+
+conditions <- fread("wga_stainings_meta.csv")
+conditions[,Condition := factor(Condition, levels = c("a", "b", "c", "g", "d", "h", "e", "f", "i", "j"))]
+conditions_mat <- conditions[,c("Condition", "WGA-Streptavidin", "WGA", "Biotin", "sbRNA")]
+
+conditions_long <- melt(conditions_mat, id.vars = "Condition", measure.vars = c(2:5), variable.name = "condition", value.name = "presence")
+setnames(conditions_long, "Condition", "id")
+
+# condition matrix
+
+p_mat <- ggplot(conditions_long, aes(id, condition)) +
+  geom_point(aes(shape = factor(presence)), size = 3) +
+  scale_shape_manual(values = c("0" = 1, "1" = 16)) +
+  theme_minimal() +
+  theme(
+    axis.title.x = element_blank(),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.title.y = element_blank(),
+    panel.grid = element_blank()
+  ) +
+  scale_x_discrete(expand = expansion(add = 1))
+
+# plot
+
+pi <- ggplot(data = conditions[Intensity_MeanIntensity_PI != 0], 
+       aes(x = Condition,
+           y = Intensity_MeanIntensity_PI)) +
+  geom_boxplot() +
+  scale_y_continuous(transform = "log10", limits = c(1e-06, 1), breaks = 10^seq(-6, 0, by = 1), expand = expansion(mult = c(0.02, 0.05))) +
+  theme_minimal() +
+  labs(
+    y = "PI mean intensity",
+    x = NULL
+  ) +
+  annotation_logticks(sides = "l") + 
+  theme(
+    axis.title.x = element_blank(),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    panel.grid = element_blank(),
+    panel.border = element_blank(),
+  ) +
+  scale_x_discrete(expand = expansion(add = 1))
+
+dna <- ggplot(data = conditions, 
+       aes(x = Condition,
+           y = Intensity_MeanIntensity_DNA)) +
+  geom_boxplot() +
+  scale_y_continuous(transform = "log10", limits = c(1e-06, 1), breaks = 10^seq(-6, 0, by = 1), expand = expansion(mult = c(0.02, 0.05)))  +
+  theme_minimal() +
+  labs(
+    y = "Hoechst 33342 mean intensity",
+    x = NULL
+  ) +
+  annotation_logticks(sides = "l") + 
+  theme(
+    axis.title.x = element_blank(),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    panel.grid = element_blank(),
+    panel.border = element_blank(),
+  ) +
+  scale_x_discrete(expand = expansion(add = 1))
+
+pi / p_mat + plot_layout(heights = c(3, 1))
+
+# ggsave("pdfs_man/boxplot_PI.pdf")
+
+dna / p_mat + plot_layout(heights = c(3, 1))
+
+# ggsave("pdfs_man/boxplot_DNA.pdf")
+
+```

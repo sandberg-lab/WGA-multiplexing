@@ -1,0 +1,936 @@
+---
+title: "sbRNA_droplet_scRNAseq_analysis"
+author: "Juliane Mayr"
+date: "2026-06-25"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+if (!requireNamespace("renv", quietly = TRUE)) {
+  install.packages("renv")
+}
+
+if (!renv::status()$synchronized) {
+  renv::restore(prompt = FALSE)
+}
+
+```
+
+```{r}
+
+suppressPackageStartupMessages({
+library(data.table)
+library(Biostrings)
+library(ggplot2)
+library(ggpointdensity)
+library(dplyr)
+library(Seurat)
+library(glmGamPoi)
+library(patchwork)
+library(pheatmap)
+library(stringdist)
+library(ggpointdensity)
+library(ggridges)
+library(Matrix)
+})
+
+setDTthreads(2)
+set.seed(42)
+
+```
+
+stats table and QC plots
+
+```{r}
+
+dir <- getwd()
+rpc <- fread(paste0(dir, "/sbrna_droplet_scRNAseq.readspercell.txt"))
+
+rpc <- rpc[RG != "bad",]
+rpc <- dcast(rpc, RG~type, fill = 0, value.var = "N")
+rpc[,total_reads_per_cell := as.numeric(Ambiguity+Exon+Intergenic+Intron+Unmapped+User)][
+        ,percent_exonintron := as.numeric((Exon+Intron)/total_reads_per_cell)][
+              ,percent_intergenic := as.numeric(Intergenic)/total_reads_per_cell]
+
+# human/mouse reads
+
+rds <- readRDS(paste0(dir, "/sbrna_droplet_scRNAseq.dgecounts.rds"))
+umiexall <- as.matrix(rds$umicount$exon$all)
+# write.table(umiexall, gzfile("sbrna_droplet_scRNAseq.exon_umi_counts.mtx.gz"), sep = "\t", quote = FALSE, row.names = TRUE, col.names = NA)
+readexall <- as.matrix(rds$readcount$exon$all)
+# write.table(readexall, gzfile("sbrna_droplet_scRNAseq.exon_read_counts.mtx.gz"), sep = "\t", quote = FALSE, row.names = TRUE, col.names = NA)
+
+complexity <- data.table(
+  XC_NovaSeq = colnames(readexall),
+  nGenes = colSums(readexall > 0),
+  hs_reads = colSums(readexall[grep("ENSG",row.names(readexall)),]),
+  mm_reads = colSums(readexall[grep("ENSMUS",row.names(readexall)),]),
+  fract_hs_reads = colSums(readexall[grep("ENSG",row.names(readexall)),])/colSums(readexall),
+  fract_mm_reads = colSums(readexall[grep("ENSMUS",row.names(readexall)),])/colSums(readexall)       
+)
+
+complexity[fract_hs_reads < 0.75 & fract_mm_reads < 0.75, species := "mixed"][
+      fract_hs_reads >= 0.75 , species := "Human"][
+      fract_mm_reads >= 0.75 , species := "Mouse"]
+
+rpc_hsmm <- merge(rpc, complexity, by.x = "RG", by.y = "XC_NovaSeq")
+
+# convert ENSEMBL-IDs to gene names
+
+genenames <- fread(paste0(dir, "/sbrna_droplet_scRNAseq.gene_names.txt"))
+genenames <- rbind(genenames,
+                   data.table(
+                     gene_id = row.names(readexall)[which(!row.names(readexall) %in% genenames$gene_id)],
+                     gene_name = row.names(readexall)[which(!row.names(readexall) %in% genenames$gene_id)]
+                   ))
+genenames_match <- genenames[match(row.names(readexall),gene_id)]
+genenames_match[duplicated(gene_name), gene_name:= paste0(gene_name,sample(genenames_match[duplicated(gene_name),.N], replace = F))]
+row.names(readexall) <- genenames_match$gene_name
+rownames(readexall)[rownames(readexall) == "generic_spike_3p"] <- "generic_sbRNA_3p"
+
+# sbRNA and mitochondrial reads and fractions
+
+mito_sbrna <- data.table( XC_NovaSeq = colnames(readexall),
+                    mitoFrac = colSums(readexall[grep("^mt-|^MT-", row.names(readexall)),])/colSums(readexall),
+                    n_reads_total_sbrna = readexall[grep("generic_sbRNA_3p", row.names(readexall)),],
+                    sbrnaFrac = readexall[grep("generic_sbRNA_3p", row.names(readexall)),]/colSums(readexall))
+
+
+rpc_hsmm_mito_sbrna <- merge(rpc_hsmm, mito_sbrna, by.x = "RG", by.y = "XC_NovaSeq")
+
+ggplot(rpc_hsmm_mito_sbrna, aes(total_reads_per_cell, percent_exonintron*100)) +
+  ggpointdensity::geom_pointdensity(show.legend = FALSE) + 
+  scale_color_viridis_c() +
+  scale_x_continuous(trans="log10") +
+  theme_bw() +
+  theme(panel.grid = element_blank()) +
+  xlab("n_reads") +
+  ylab("percent_exon+intron") +
+  geom_vline(xintercept = 3e04, linetype = "dashed") +  
+  geom_hline(yintercept = 65, linetype = "dashed")
+
+# ggsave("./pdfs_man/QC_nreads_percentexonintron_scatterplot.pdf")
+
+ggplot(rpc_hsmm_mito_sbrna, aes(total_reads_per_cell, percent_intergenic*100)) +
+  ggpointdensity::geom_pointdensity(show.legend = FALSE) + 
+  scale_color_viridis_c() +
+  scale_x_continuous(trans="log10") +
+  theme_bw() +
+  theme(panel.grid = element_blank()) +
+  geom_vline(xintercept = 3e04, linetype = "dashed") +  
+  geom_hline(yintercept = 22, linetype = "dashed")
+
+# ggsave("./pdfs_man/QC_nreads_percentintergenic_scatterplot.pdf")
+
+ggplot(rpc_hsmm_mito_sbrna, aes(total_reads_per_cell, mitoFrac*100)) +
+  ggpointdensity::geom_pointdensity(show.legend = FALSE) + 
+  scale_color_viridis_c() +
+  scale_x_continuous(trans="log10") +
+  theme_bw() +
+  theme(panel.grid = element_blank()) +
+  xlab("n_reads") +
+  ylab("percent_mito_reads") +
+  geom_vline(xintercept = 3e04, linetype = "dashed") +  
+  geom_hline(yintercept = 20, linetype = "dashed")
+
+# ggsave("./pdfs_man/QC_nreads_percentmito_scatterplot.pdf")
+
+ggplot(rpc_hsmm_mito_sbrna, aes(total_reads_per_cell, sbrnaFrac*100)) +
+  ggpointdensity::geom_pointdensity(show.legend = FALSE) + 
+  scale_color_viridis_c() +
+  scale_x_continuous(trans="log10") +
+  theme_bw() +
+  theme(panel.grid = element_blank()) +
+  xlab("n_reads") +
+  ylab("percent_sbRNA_reads") +
+  geom_vline(xintercept = 3e04, linetype = "dashed")
+
+# ggsave("./pdfs_man/QC_nreads_percentsbrna_scatterplot.pdf")
+
+ggplot(rpc_hsmm_mito_sbrna, aes(fill = species, x = hs_reads, y = mm_reads)) + 
+  geom_point(alpha = 0.33, shape = 21) + 
+  theme_classic() + 
+  xlab("Reads Human (species mix)") + 
+  ylab("Reads Mouse (species mix)")
+
+# ggsave("./pdfs_man/scatterplot_mousehumanmixed.pdf")
+
+filtered_bcs <- rpc_hsmm_mito_sbrna[total_reads_per_cell > 3e04 & percent_exonintron > 0.65 & percent_intergenic < 0.22 & mitoFrac < 0.20 & species != "mixed", RG]
+
+
+# number of cells after QC filtering
+
+length(filtered_bcs) # 1556
+
+# median fraction of sbRNA reads of total sequenced reads
+
+median(rpc_hsmm_mito_sbrna[,sbrnaFrac]) # 0.01225483
+
+```
+
+recover sbRNA reads
+
+```{r}
+
+# read in extracted sbRNA reads as extracted using UMIcountR (see umicountR.Rmd)
+
+sbRNA_reads <- fread(paste0(dir, "/sbrna_droplet_scRNAseq.extracted.sbrna.dat.csv.gz"))
+
+# recover reads with max hamming distance 2
+
+max_dist <- 2
+
+sbRNA_seq_mapping <- data.table(
+  sbRNA_seq = c("TATTATTTCTTTCA", # 3
+               "TCTTTATTGTTTAC", # 20
+               "AAAGGGTAATATGT", # 27
+               "TTGTCTTTGTATTG", # 36
+               "TTTTTATGTTAGTA", # 52
+               "TAATTTCCTTTAAT", # 31
+               "TTTAAATCAGTTGC"), # 54
+  sbRNA_id = c("sbRNA-3",
+              "sbRNA-20",
+              "sbRNA-27", 
+              "sbRNA-36", 
+              "sbRNA-52", 
+              "sbRNA-31", 
+              "sbRNA-54")
+)
+
+dists <- stringdistmatrix(sbRNA_reads$sbRNA_UMI, sbRNA_seq_mapping$sbRNA_seq, method = "hamming", nthread = 4)
+
+dists_long <- melt(dists, value.name = "distance", )
+setDT(dists_long)
+setnames(dists_long, c("readidx", "sbRNA_idx", "distance"))
+setorder(dists_long, distance)
+dists_long <- dists_long[, .SD[1], by = "readidx"]
+
+dists_long <- dists_long[distance < (max_dist+1)]
+
+sbRNA_seq_mapping[, sbRNA_idx := seq(.N)]
+dists_long <- merge(dists_long, sbRNA_seq_mapping, by = "sbRNA_idx")
+sbRNA_reads[, readidx := seq(.N)]
+sbRNA_reads <- merge(sbRNA_reads, dists_long, by = "readidx")
+
+# remove cells that were excluded based on initial QC
+
+sbRNA_reads_filtered <- sbRNA_reads[BC %in% filtered_bcs,]
+
+```
+
+sbRNA stats
+
+```{r}
+
+# number of molecules per sbRNA per cell
+
+colors <- c(
+      "sbRNA-20" = "#F8766D",
+      "sbRNA-27" = "#C49A00",
+      "sbRNA-3" = "#53B400",
+      "sbRNA-31" = "#00C094",
+      "sbRNA-36" = "#00B6EB",
+      "sbRNA-52" = "#A58AFF",
+      "sbRNA-54" = "#FB61D7",
+      "Doublet" = "#7F7F7F",
+      "Negative" = "#D3D3D3"
+      )
+
+sbRNA_counttable <- sbRNA_reads_filtered[, .(molPC = uniqueN(UB)), by = .(BC, sbRNA_id)]
+sbRNA_counttable[,total_sbRNA_mol_per_cell := sum(molPC), by = BC]
+sbRNA_counttable[,fraction := molPC/total_sbRNA_mol_per_cell]
+
+setorder(sbRNA_counttable, -molPC)
+sbRNA_counttable_top2 <- sbRNA_counttable[, .SD[1:2], by = "BC"]
+sbRNA_counttable_top2[, diff := molPC[1] - molPC[2], by = "BC"]
+sbRNA_counttable_top2[, ratio := molPC[1]/molPC[2], by = "BC"]
+sbRNA_counttable_top1 <- sbRNA_counttable_top2[, .SD[1], by = BC] # extract highest scoring sbRNA
+sbRNA_counttable_top1[, sbRNA_filtered := ifelse(diff != 0, sbRNA_id, NA)] # remove equal counts for 2 top sbRNAs
+
+# density plot top sbRNA counts
+
+ggplot(sbRNA_counttable_top1[!is.na(sbRNA_id)], aes(x = molPC, fill = sbRNA_id)) +
+  geom_density(position = "stack", alpha = 0.8, color = "black") +
+  geom_vline(xintercept = 5, linetype = "dashed", colour = "red") +
+  scale_x_log10(breaks = c(1, 5, 10, 100, 1000),labels = c("1", "5", "10", "100", "1000")) +
+  theme_bw(base_size = 14) +
+  scale_fill_manual(values = colors) +
+  #scale_colour_manual(values = colors) +
+  labs(x = "Top sbRNA counts per cell",
+       y = "Density",
+       title = "Stacked density of top sbRNA counts")
+
+# ggsave("./pdfs_man/density_sbRNAcounts_topsbRNA.pdf")
+
+```
+
+Seurat clustering and UMAP
+
+```{r}
+
+meta_filter <- as.data.frame(rpc_hsmm_mito_sbrna[RG %in% filtered_bcs])
+rownames(meta_filter) <- meta_filter$RG
+meta_filter$RG <- NULL
+
+# convert ENSEMBL-IDs to gene names (UMI counts)
+
+genenames <- fread(paste0(dir, "/sbrna_droplet_scRNAseq.gene_names.txt"))
+genenames <- rbind(genenames,
+                   data.table(
+                     gene_id = row.names(umiexall)[which(!row.names(umiexall) %in% genenames$gene_id)],
+                     gene_name = row.names(umiexall)[which(!row.names(umiexall) %in% genenames$gene_id)]
+                   ))
+genenames_match <- genenames[match(row.names(umiexall),gene_id)]
+genenames_match[duplicated(gene_name), gene_name:= paste0(gene_name,sample(genenames_match[duplicated(gene_name),.N], replace = F))]
+row.names(umiexall) <- genenames_match$gene_name
+rownames(umiexall)[rownames(umiexall) == "generic_spike_3p"] <- "generic_sbRNA_3p"
+
+seuob <- Seurat::CreateSeuratObject(counts = umiexall[,filtered_bcs], project = "WGA_10x", meta.data = meta_filter)
+
+FeatureScatter(seuob, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+seuob <- Seurat::SCTransform(seuob, seed.use = 42)
+seuob <- RunPCA(seuob, seed.use = 42)
+ElbowPlot(seuob, ndims = 50)
+seuob <- FindNeighbors(seuob, dims = 1:20)
+seuob <- FindClusters(seuob, random.seed = 42)
+seuob <- RunUMAP(seuob, dims = 1:20, seed.use = 42)
+
+DimPlot(seuob, reduction = "umap")
+
+# ggsave("./pdfs_man/UMAP_clusterID.pdf")
+
+DimPlot(seuob, reduction = "umap", group.by = "species")
+
+# ggsave("./pdfs_man/UMAP_species.pdf")
+ 
+```
+
+souporcell assignment
+
+```{r}
+soup <- fread(paste0(dir, "/sbrna_droplet_scRNAseq.clusters.tsv"))
+
+soup_used <- soup[barcode %in% filtered_bcs] # keep only expected barcodes
+soup_used <- soup_used[assignment %in% c(0, 1, 2, 3, 4, 5, 6, 7, 8)]
+soup_used$assignment <- paste0("donor",soup_used$assignment)
+
+soup_sum <- soup_used[, .(count = .N), .(assignment)]
+snp_assignments <- soup_used[!(assignment %in% c("doublet", "unassigned")), c("barcode", "assignment")]
+setnames(snp_assignments,"assignment", "assignment_souporcell")
+
+snp_assignments <- as.data.frame(snp_assignments)
+rownames(snp_assignments) <- snp_assignments$barcode
+snp_assignments$barcode <- NULL
+seuob <- AddMetaData(seuob, metadata = snp_assignments)
+
+DimPlot(seuob, reduction = "umap", group.by = "assignment_souporcell")
+
+# ggsave("./pdfs_man/UMAP_souporcell.pdf")
+
+# rename split Seurat clusters based on souporcell identity
+
+seuob$merged_clusters <- as.character(seuob$seurat_clusters)
+seuob$merged_clusters[seuob$merged_clusters %in% c("1", "4", "7")] <- "1"
+ordered_clusters <- names(sort(table(seuob$merged_clusters), decreasing = TRUE))
+seuob$merged_clusters <- match(as.character(seuob$merged_clusters), ordered_clusters) - 1
+seuob$merged_clusters_label <- paste0("c", seuob$merged_clusters)
+
+DimPlot(seuob, reduction = "umap", group.by = "merged_clusters_label", label = T, repel = TRUE)
+
+# ggsave("./pdfs_man/UMAP_seuratclusters_merged.pdf")
+
+# label clusters with merged cluster ID
+
+p <- DimPlot(seuob, reduction = "umap", group.by = "assignment_souporcell",label = F)
+
+p +
+  ggrepel::geom_text_repel(
+    data = data.frame(
+      Embeddings(seuob, "umap"),
+      cluster = seuob$merged_clusters
+    ) |>
+      dplyr::group_by(cluster) |>
+      dplyr::summarise(
+        UMAP_1 = median(umap_1),
+        UMAP_2 = median(umap_2)
+      ),
+    aes(x = UMAP_1, y = UMAP_2, label = paste0("c", cluster)),
+    inherit.aes = FALSE,
+    size = 4,
+    color = "#8F8F8F",
+    fontface = "bold",
+    force = 5,
+    point.padding = 2
+    
+  )
+
+# ggsave("./pdfs_man/UMAP_souporcell_withclusters_merged.pdf")
+
+# souporcell assignments per merged Seurat cluster
+
+soc <- copy(seuob@meta.data)
+setDT(soc, keep.rownames = T)
+
+soc_counts <- soc[, .(n_cells_label = .N), by = c("merged_clusters_label", "assignment_souporcell")]
+soc_totals <- soc[, .(n_cells_group = .N), by = "merged_clusters_label"]
+soc_plot <- merge(soc_counts, soc_totals, by = "merged_clusters_label")
+soc_plot[, fraction := n_cells_label / n_cells_group]
+
+ggplot(soc_plot, aes(x = factor(merged_clusters_label), y = fraction * 100, fill = assignment_souporcell)) +
+    geom_bar(stat = "identity") +
+    labs(y = "percentage", x = "merged cluster") +
+    theme_minimal() +
+    theme(axis.text.y = element_text(size = 10)) +
+    coord_flip()
+
+# ggsave("./pdfs_man/bars_cellline_souoporcell.pdf")
+
+```
+
+cell line annotation
+
+```{r}
+
+# read DepMap info
+
+ccle <- fread(paste0(dir,"/resources/OmicsExpressionTPMLogp1HumanProteinCodingGenes.csv"))
+
+ccle <- ccle[IsDefaultEntryForModel == "Yes"]
+
+gene_cols <- names(ccle)[!(names(ccle) %in% c(
+  "ProfileID",
+  "ModelID",
+  "V1",
+  "SequencingID",
+  "ModelConditionID",
+  "IsDefaultEntryForModel",
+  "IsDefaultEntryForMC"
+))]
+
+clean_names <- gsub(" \\(.*\\)", "", gene_cols)
+
+anyDuplicated(clean_names) # no duplicated gene names
+
+names(ccle)[names(ccle) %in% gene_cols] <- clean_names
+expr <- as.data.frame(ccle)
+rownames(expr) <- expr$ModelID
+
+expr <- expr[ ,
+    !(names(expr) %in%
+      c("V1",
+        "SequencingID",
+        "ModelID",
+        "ModelConditionID",
+        "IsDefaultEntryForModel",
+        "IsDefaultEntryForMC"))
+]
+
+expr <- t(as.matrix(expr))
+
+# correlate pseudobulk per cluster with reference RNA-seq data for human cell lines
+
+seurat_human <- subset(seuob, subset = species == "Human")
+human_cluster_ids <- unique(seurat_human$merged_clusters_label)
+
+# make pseudobulk per cluster
+
+pb <- AggregateExpression(
+    seurat_human,
+    assays = "RNA",
+    group.by = "merged_clusters_label",
+    return.seurat = FALSE
+)$RNA
+
+# normalize pseudobulk to compare to normalized ccle expression data (gene length not accounted for in pseudobulk normalization)
+
+pb_cpm <- t(t(pb) / colSums(pb) * 1e6)
+pb_log <- log2(pb_cpm + 1)
+
+cor_to_ccle <- function(cluster_vec, expr_matrix) {
+
+    common <- intersect(names(cluster_vec), rownames(expr_matrix))
+
+    cluster_vec <- cluster_vec[common]
+    expr_matrix <- expr_matrix[common, , drop = FALSE]
+
+    cors <- apply(
+        expr_matrix,
+        2,
+        function(x)
+            cor(
+    cluster_vec,
+    x,
+    method = "spearman",
+    use = "pairwise.complete.obs"
+)
+    )
+
+    sort(cors, decreasing = TRUE)
+}
+
+# add model info
+
+models <- fread(paste0(dir,"/resources/Model.csv"))
+
+results_list <- list()
+
+for (cl in colnames(pb_log)) {
+
+    message("Processing cluster: ", cl)
+
+    cors <- cor_to_ccle(pb_log[, cl], expr)
+
+    hits <- data.frame(
+        ModelID = names(cors),
+        correlation = as.numeric(cors)
+    )
+
+    hits <- merge(
+        hits,
+        models[, .(
+            ModelID,
+            CellLineName,
+            OncotreeLineage,
+            OncotreePrimaryDisease
+        )],
+        by = "ModelID",
+        all.x = TRUE
+    )
+
+    hits <- hits[order(-hits$correlation), ]
+    hits$cluster <- cl
+
+    results_list[[cl]] <- hits
+}
+
+results <- do.call(rbind, results_list)
+
+# get highest scoring cell line across cell lines
+
+setDT(results, keep.rownames = T)
+
+plot_dt <- results[
+    CellLineName %in% c("THP-1", "MDA-MB-231", "MCF-7", "A549", "HEK-293") |
+        grepl("^IMR-", CellLineName),
+    .(cluster, CellLineName, correlation)
+]
+plot_dt[CellLineName == "IMR-32", CellLineName := "IMR-32 (IMR-5)"]
+
+ggplot(plot_dt,
+       aes(x = CellLineName,
+           y = factor(cluster),
+           fill = correlation)) +
+    geom_tile(color = "white") +
+    scale_fill_viridis_c() +
+    labs(
+        x = "Expected cell line",
+        y = "Cluster",
+        fill = "Spearman\ncorrelation"
+    ) +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# ggsave("./pdfs_man/heatmap_celllines.pdf")
+
+plot_dt[, cluster := as.integer(sub("^c", "", cluster))]
+
+# select top correlating cell line per cluster; adjust annotation of IMR-32 which was used as closest approximation for IMR-5 (not present in reference)
+
+best_hits <- plot_dt[order(plot_dt, -correlation), .SD[1], by = cluster]
+best_hits[CellLineName == "IMR-32", CellLineName := "IMR-5"]
+
+seuob$cellline <- best_hits$CellLineName[
+    match(as.character(seuob$merged_clusters_label),
+          as.character(paste0("c", best_hits$cluster)))]
+
+# identify mouse cell lines based on marker genes
+
+markers_list <- list(
+  "B16" = c("Pmel", "Mlana", "Mitf", "Slc45a2"),
+  "4T1" = c("Epcam", "Krt8", "Krt18", "Krt19"),
+  "MPC" = c("Phox2a", "Slc18a1", "Ret", "Phox2b", "Th", "Dbh", "Scg5")
+)
+
+missing_cells <- is.na(seuob$cellline)
+
+seuob <- AddModuleScore(
+  object = seuob,
+  features = markers_list,
+  name = "cellline_score")
+
+colnames(seuob@meta.data)[
+  grep("cellline_score", colnames(seuob@meta.data))
+] <- names(markers_list)
+
+cluster_scores <- seuob@meta.data |>
+  dplyr::group_by(merged_clusters_label) |>
+  dplyr::summarise(across(names(markers_list), mean))
+
+cluster_assignments <- cluster_scores |>
+  tidyr::pivot_longer(
+    cols = c(B16, `4T1`,MPC),
+    names_to = "predicted_cellline",
+    values_to = "score"
+  ) |>
+  group_by(merged_clusters_label) |>
+  slice_max(
+    order_by = score,
+    n = 1,
+    with_ties = FALSE
+  ) |>
+  ungroup()
+
+cluster_map <- setNames(cluster_assignments$predicted_cellline, as.character(cluster_assignments$merged_clusters_label))
+predicted <- unname(cluster_map[as.character(seuob$merged_clusters_label)])
+missing <- is.na(seuob$cellline)
+seuob$cellline[missing] <- predicted[missing]
+
+cellline_plots <- VlnPlot(
+  seuob,
+  features = names(markers_list),
+  group.by = "merged_clusters_label",
+  combine = FALSE,
+  fill = names(markers_list)
+)
+
+cellline_plots
+
+# Map(function(p, nm) {ggsave(filename = paste0("./pdfs_man/vlnplot_", paste(nm, collapse = "_"), ".pdf"), plot = p, width = 13, height = 7, units = "cm")}, cellline_plots, names(markers_list))
+
+p2 <- DimPlot(seuob, reduction = "umap", group.by = "cellline", label = F)
+
+p2 +
+  ggrepel::geom_text_repel(
+    data = data.frame(
+      Embeddings(seuob, "umap"),
+      cluster = seuob$merged_clusters
+    ) |>
+      dplyr::group_by(cluster) |>
+      dplyr::summarise(
+        UMAP_1 = median(umap_1),
+        UMAP_2 = median(umap_2)
+      ),
+    aes(x = UMAP_1, y = UMAP_2, label = paste0("c", cluster)),
+    inherit.aes = FALSE,
+    size = 4,
+    color = "#8F8F8F",
+    fontface = "bold",
+    force = 5,
+    point.padding = 2
+    
+  )
+
+# ggsave("./pdfs_man/UMAP_celllines.pdf")
+
+```
+
+add sbRNA info to seurat
+
+```{r}
+
+sb_mat <- dcast(
+  sbRNA_counttable,
+  sbRNA_id ~ BC,
+  value.var = "molPC",
+  fill = 0
+)
+
+rownames <- sb_mat$sbRNA_id
+sb_mat <- as.matrix(sb_mat[, sbRNA_id := NULL])
+rownames(sb_mat) <- rownames
+
+# add as its own assay to Seurat object
+
+identical(colnames(seuob), colnames(sb_mat))
+seuob[["HTO"]] <- CreateAssay5Object(counts = sb_mat)
+
+DefaultAssay(seuob) <- "HTO"
+seuob <- NormalizeData(seuob, assay="HTO", normalization.method="CLR", margin=2)
+
+
+seuob <- HTODemux(seuob, assay="HTO", positive.quantile=0.99)
+
+colors <- c(
+      "sbRNA-20" = "#F8766D",
+      "sbRNA-27" = "#C49A00",
+      "sbRNA-3" = "#53B400",
+      "sbRNA-31" = "#00C094",
+      "sbRNA-36" = "#00B6EB",
+      "sbRNA-52" = "#A58AFF",
+      "sbRNA-54" = "#FB61D7",
+      "Doublet" = "#7F7F7F",
+      "Negative" = "#D3D3D3"
+      )
+
+seuob$hash.ID <- factor(
+  seuob$hash.ID,
+  levels = names(colors)
+)
+
+DimPlot(seuob, group.by="hash.ID", cols = colors, pt.size=.5)
+
+# ggsave("./pdfs_man/UMAP_sbRNAs.pdf")
+
+# assignment stacked bar plots
+
+md <- copy(seuob@meta.data)
+setDT(md, keep.rownames = T)
+
+md[,n_cells_cellline := .N, by = "cellline"]
+md[,n_cells_sbRNA := .N, by = c("cellline", "hash.ID")]
+md[,fraction_sbRNA := n_cells_sbRNA/n_cells_cellline]
+
+
+md_plottable <- unique(md[,c("cellline", "hash.ID", "fraction_sbRNA")])
+md_plottable[, stack_order := NA_real_]
+md_plottable[!is.na(hash.ID), stack_order := rank(-fraction_sbRNA, ties.method = "first"), by = cellline]
+md_plottable[is.na(hash.ID), stack_order := Inf]
+
+# set cell line order
+
+cellline_order <- md_plottable[hash.ID != "Negative", .(max_sbRNA_fraction = max(fraction_sbRNA, na.rm = TRUE)),
+                               by = cellline][order(-max_sbRNA_fraction),cellline]
+
+md_plottable[,cellline := factor(cellline, levels = cellline_order)]
+
+ggplot(md_plottable, aes(x = cellline, y = fraction_sbRNA*100, fill = hash.ID)) +
+  geom_bar(stat = "identity", position = position_stack(reverse = TRUE)) +
+  labs(x = "cell line", y = "percentage") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_manual(values = colors)
+
+# ggsave("./pdfs_man/stackedBarplot_sbRNAs_cellline.pdf")
+
+```
+
+assignment comparisons 
+
+```{r}
+
+exp_sbRNA <- data.table(
+  cellline = c("A549","HEK-293","MCF-7","IMR-32 (IMR-5)","B16","THP-1","MDA-MB-231","4T1","MPC"),
+  expected_sbRNA = c("sbRNA-36","sbRNA-3","sbRNA-20","sbRNA-27","sbRNA-31","Negative" ,"sbRNA-54","sbRNA-54","sbRNA-52")
+)
+sbRNA_ex <- merge(md, exp_sbRNA, by = "cellline", all.x = T)
+
+sbRNA_ex[, assignment := ifelse(
+  expected_sbRNA == "Negative",            # if expected sbRNA is Negative:
+    ifelse(
+      hash.ID == "Negative",               # and assigned sbRNA is Negative
+      "correct",                           # then mark as correct
+      "wrong"                              # otherwise mark as wrong
+    ),
+  ifelse(                                  # if expected sbRNA is NOT Negative:
+    hash.ID == "Negative",                 # if assigned sbRNA is Negative
+    "unassigned",                          # then mark as unassigned
+    ifelse(
+      hash.ID == expected_sbRNA,           # otherwise if assigned sbRNA is same as expected
+      "correct",                           # then mark as correct
+      ifelse(
+        hash.ID == "Doublet",              # otherwise if assigned sbRNA is Doublet
+        "doublet",                         # then mark as doublet
+        "wrong")                           # otherwise (if assign sbRNA is other sbRNA than expected) mark as wrong
+      )
+    ))]
+
+assdt <- sbRNA_ex[,.(
+    n_all = .N,
+    n_correct = sum(assignment == "correct", na.rm = TRUE),
+    n_wrong = sum(assignment == "wrong", na.rm = TRUE),
+    n_unassigned = sum(assignment == "unassigned", na.rm = TRUE),
+    n_doublet = sum(assignment == "doublet", na.rm = TRUE)
+  ),
+  by = cellline][,`:=`(
+    fraction_correct = n_correct / n_all,
+    fraction_wrong = n_wrong / n_all,
+    fraction_unassigned = n_unassigned / n_all,
+    fraction_doublet = n_doublet / n_all,
+    fraction_singlet = (n_correct+n_wrong)/n_all
+  )]
+
+# fraction correctly assigned
+
+mean(assdt[cellline != "THP-1", fraction_correct]) # 0.8377726
+assdt[cellline == "MPC", fraction_correct] # 0.9666667
+assdt[cellline == "B16", fraction_correct] # 0.5777262
+
+# fraction correctly assigned THP-1 (unlabeled)
+
+assdt[cellline == "THP-1", fraction_correct] # 0.9534884
+
+# fraction correctly assigned 4T1, MDA-MB-231
+
+assdt[cellline == "4T1", fraction_correct] # 0.8333333
+assdt[cellline == "MDA-MB-231", fraction_correct] # 0.8820225
+
+# mean accuracy across labeled cell lines
+
+mean(assdt[cellline != "THP-1", fraction_correct]) # 0.8377726
+
+```
+
+sbRNA distributions
+
+```{r}
+
+sbRNA_ctseu <- merge(sbRNA_counttable, md[,c("rn","cellline")], by.x = "BC", by.y = "rn")
+
+# set order of sbRNA stacking
+
+rna_order <- sbRNA_ctseu[, .(mean_fraction = mean(fraction, na.rm = TRUE)), by = .(cellline, sbRNA_id)]
+rna_order[, stack_rank := rank(-mean_fraction, ties.method = "first"), by = cellline]
+
+sbRNA_ctseu[rna_order, stack_rank := i.stack_rank, on = .(cellline, sbRNA_id)]
+
+cell_order <- dcast(
+  sbRNA_ctseu,
+  cellline + BC ~ stack_rank,
+  value.var = "fraction",
+  fill = 0
+)
+
+rank_cols <- setdiff(names(cell_order), c("cellline", "BC"))
+rank_cols <- rank_cols[order(as.integer(rank_cols))]
+
+setorderv(cell_order, cols = c("cellline", rank_cols), order = c(1L, rep(-1L, length(rank_cols))))
+cell_order[, CellOrder := seq_len(.N), by = cellline]
+
+sbRNA_ctseu[cell_order, CellOrder := i.CellOrder, on = .(cellline, BC)]
+
+ggplot(sbRNA_ctseu, aes(x = CellOrder, y = fraction*100, fill = sbRNA_id, order = fraction, group = interaction(cellline, BC, stack_rank))) +
+  geom_bar(stat = "identity",position = position_stack(reverse = TRUE)) +
+  labs(x = "cells", y = "percentage") +
+  facet_wrap(~cellline, scales = "free_x") +
+  theme_minimal() +
+  theme(axis.text.x = element_blank(),
+    axis.ticks.x = element_blank()
+    ) +
+  scale_fill_manual(
+    values = colors)
+
+# ggsave("./pdfs_man/stackedsbRNAs_percell_cellline.pdf")
+
+```
+
+HTO margin distribution
+
+```{r}
+
+df <- FetchData(seuob, vars = c("HTO_margin", "hash.ID"))
+
+ggplot(df,aes(x = HTO_margin, y = hash.ID, height = after_stat(density), fill = hash.ID, colour = hash.ID)) +
+  geom_density_ridges(scale = 2, rel_min_height = 0.001, alpha = 0.7) +
+  theme_bw(base_size = 14) +
+   scale_fill_manual(values = colors) +
+  scale_colour_manual(values = colors) +
+  labs(
+    x = "HTO_margin",
+    y = NULL,
+    title = "Distribution HTO_margin",
+    fill = "hash.ID",
+    colour = "hash.ID"
+  ) +
+  scale_y_discrete(limits = rev)
+
+# ggsave("./pdfs_man/density_HTOmargin_washMix.pdf")
+
+```
+
+fraction of top sbRNA counts of total cell umi counts
+
+```{r}
+
+sbrna_cts <- sbRNA_ctseu[,c("BC", "sbRNA_id", "molPC")]
+setnames(sbrna_cts, c("BC", "sbRNA_id"), c("rn", "HTO_maxID"))
+
+sbrna_cts_sub <- sbrna_cts[md[, .(rn, HTO_maxID)], on = .(rn, HTO_maxID), nomatch = 0]
+
+sbrna_cts_sub <- as.data.frame(sbrna_cts_sub)
+rownames(sbrna_cts_sub) <- sbrna_cts_sub$rn
+sbrna_cts_sub$rn <- NULL
+seuob <- AddMetaData(seuob, metadata = sbrna_cts_sub)
+
+seuob@meta.data$sbRNA_fraction_of_total_UMIs <- seuob@meta.data$molPC/seuob@meta.data$nCount_RNA
+seuob@meta.data$sbRNA_fraction_of_total_UMIs_log <- log10(seuob@meta.data$sbRNA_fraction_of_total_UMIs)
+
+global_min <- floor(min(seuob$sbRNA_fraction_of_total_UMIs_log, na.rm = TRUE))
+global_max <- ceiling(max(seuob$sbRNA_fraction_of_total_UMIs_log, na.rm = TRUE))
+
+# all sbRNAs in one UMAP
+
+FeaturePlot(seuob, 
+            features = "sbRNA_fraction_of_total_UMIs_log", 
+            reduction = "umap",
+            min.cutoff = global_min,
+            max.cutoff = global_max
+            ) +
+  scale_color_gradient(
+    low = "#E6D5F5",      # light purple
+    high = "#5B0A91",     # dark purple
+    na.value = "grey80",
+    limits = c(global_min, global_max),
+    oob = scales::squish,
+    name = "Fraction of total UMIs (log10)",
+    breaks = c(global_min, (global_min + global_max) / 2, global_max)
+  )
+
+# ggsave("./pdfs_man/UMAP_fraction_sbRNAcounts_oftotalcounts_log.pdf")
+
+# one UMAP per sbRNA
+
+sbRNA_ctseu_long <- dcast(
+  sbRNA_ctseu,
+  BC ~ sbRNA_id,
+  value.var = "molPC"
+)
+
+# add to Seurat meta data
+sbRNA_ctseu_long <- as.data.frame(sbRNA_ctseu_long)
+rownames(sbRNA_ctseu_long) <- sbRNA_ctseu_long$BC
+sbRNA_ctseu_long$BC <- NULL
+seuob <- AddMetaData(seuob, metadata = sbRNA_ctseu_long)
+
+cols <- names(seuob@meta.data)[grep("sbRNA-", names(seuob@meta.data))]
+seuob@meta.data[, paste0(cols, "_fraction")] <-
+  seuob@meta.data[, cols, drop = FALSE] / seuob@meta.data$nCount_RNA
+cols_frac <- names(seuob@meta.data[paste0(cols, "_fraction")])
+seuob@meta.data[paste0(cols_frac, "_log10")] <-
+  lapply(seuob@meta.data[cols_frac], log10)
+
+# plot for all sbRNA counts
+
+global_min <- floor(min(seuob@meta.data[paste0(cols_frac, "_log10")], na.rm = TRUE))
+global_max <- ceiling(max(seuob@meta.data[paste0(cols_frac, "_log10")], na.rm = TRUE))
+
+plots_all <- lapply(cols_frac, function(sb) {
+  
+FeaturePlot(
+    seuob,
+    features = paste0(sb, "_log10"),
+    reduction = "umap",
+    min.cutoff = global_min,
+    max.cutoff = global_max
+    ) +
+    ggtitle(sb) +
+  scale_color_gradient(
+    low = "#E6D5F5",
+    high = "#5B0A91",
+    na.value = "grey80",
+    limits = c(global_min, global_max),
+    oob = scales::squish,
+    name = "Fraction of total UMIs (log10)",
+    breaks = c(global_min, (global_min + global_max) / 2, global_max)
+  )
+})
+
+plots_all
+
+# Map(function(p, nm) {ggsave(filename = paste0("./pdfs_man/UMAP_umis_fraction_allsbRNAs_log_purple_", nm, ".pdf"), plot = p, width = 20, height = 13, units = "cm")}, plots_all, cols)
+
+# write.table(seuob@meta.data, gzfile("sbrna_droplet_scRNAseq.annotation_file.txt.gz"), sep = "\t", quote = FALSE, row.names = TRUE, col.names = NA)
+
+# saveRDS(seuob, file = "sbrna_droplet_scRNAseq_seurat_object.rds")
+
+```

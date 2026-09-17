@@ -1,0 +1,40 @@
+---
+title: "10x_manuscript_umicountR"
+author: "Juliane Mayr"
+date: "2026-02-09"
+output: html_document
+---
+
+restore environment (via Renv package)
+```{r setup, include=FALSE}
+
+if (!requireNamespace("renv", quietly = TRUE)) {
+  install.packages("renv")
+}
+
+if (!renv::status()$synchronized) {
+  renv::restore(prompt = FALSE)
+}
+
+```
+
+```{r}
+
+library(data.table)
+setDTthreads(2)
+library(stringdist)
+library(UMIcountR)
+
+```
+
+extract sbRNA sequences from reads mapped to generic reference
+
+```{r}
+
+spike_reads <- extract_spike_dat("sbrna_droplet_scRNAseq.filtered.Aligned.GeneTagged.UBcorrected.sorted.CB.bam", spikename = "generic_spike_3p", spikecontig = "generic_spike_3p",  match_seq_before_UMI = "TCCCTCACTGCAAA", match_seq_after_UMI = "CCGAGACAGGCTTTGAGT", spikeUMI_length = 14)
+
+sbRNA_reads <- setnames(spike_reads, names(spike_reads), gsub("spikeUMI", "sbRNA_UMI", names(spike_reads)))
+
+# fwrite(sbRNA_reads, "sbrna_droplet_scRNAseq.extracted.sbrna.dat.csv")
+
+```
